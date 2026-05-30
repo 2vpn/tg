@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+INSTALL_DIR="${INSTALL_DIR:-/opt/MTProxy}"
+POOL_DIR="${POOL_DIR:-/etc/mtproxy-pool}"
+INST_DIR="${INST_DIR:-$POOL_DIR/instances}"
+RUNNER="${RUNNER:-/usr/local/bin/mtproxy-instance-run.sh}"
+SERVICE_TMPL="${SERVICE_TMPL:-/etc/systemd/system/mtproxy@.service}"
+DEFAULT_SNI_DOMAIN="${SNI_DOMAIN:-yandex.ru}"
+BINARY="$INSTALL_DIR/objs/bin/mtproto-proxy"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+need_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run this command as root"
+}
+
+usage() {
+  cat <<'EOF'
+mtproxy-pool - manage multiple Telegram MTProxy instances
+
+Usage:
+  mtproxy-pool add [--count N] [--sni DOMAIN] [--tag TAG]
+  mtproxy-pool remove INSTANCE [INSTANCE...]
+  mtproxy-pool list
+  mtproxy-pool links [--host IP_OR_DOMAIN]
+  mtproxy-pool status [INSTANCE...]
+  mtproxy-pool start INSTANCE [INSTANCE...]
+  mtproxy-pool stop INSTANCE [INSTANCE...]
+  mtproxy-pool restart [INSTANCE...]
+  mtproxy-pool refresh
+  mtproxy-pool doctor
+  mtproxy-pool uninstall
+  mtproxy-pool help
+
+Environment:
+  COUNT=3                 default count for add
+  SNI_DOMAIN=yandex.ru    default domain for fake TLS secret
+  PUBLIC_IP=1.2.3.4       override detected public host in links
+  PROXY_TAG=...           optional Telegram promotion tag
+
+Examples:
+  sudo mtproxy-pool add --count 3 --sni yandex.ru
+  sudo mtproxy-pool links
+  sudo mtproxy-pool remove ee20260527-120000-1
+EOF
+}
+
+# ── port helpers ────────────────────────────────────────────────────────────
+
+port_in_use() {
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -ltnH "sport = :$1" | grep -q .
+}
+
+port_in_files() {
+  local port="$1"
+  [[ -d "$INST_DIR" ]] || return 1
+  grep -RhoE '^(PORT|STATS_PORT)=[0-9]+' "$INST_DIR" 2>/dev/null \
+    | cut -d= -f2 \
+    | grep -qx "$port"
+}
+
+port_taken() { port_in_use "$1" || port_in_files "$1"; }
+
+pick_client_port() {
+  local port
+  local preferred=(8443 9443 10443 2053 2083 2087 2096)
+  for port in $(printf '%s\n' "${preferred[@]}" | shuf); do
+    port_taken "$port" || { echo "$port"; return; }
+  done
+  while :; do
+    port="$(shuf -i 20000-65000 -n 1)"
+    port_taken "$port" || { echo "$port"; return; }
+  done
+}
+
+pick_stats_port() {
+  local port
+  while :; do
+    port="$(shuf -i 10000-19999 -n 1)"
+    port_taken "$port" || { echo "$port"; return; }
+  done
+}
+
+domain_hex() {
+  printf '%s' "$1" | od -An -tx1 | tr -d ' \n'
+}
+
+# ── instance helpers ─────────────────────────────────────────────────────────
+
+list_instances() {
+  [[ -d "$INST_DIR" ]] || return 0
+  find "$INST_DIR" -maxdepth 1 -name '*.env' -printf '%f\n' \
+    | sed 's/\.env$//' | sort
+}
+
+load_instance() {
+  local inst="$1"
+  local env="$INST_DIR/${inst}.env"
+  [[ -f "$env" ]] || die "Instance not found: $inst"
+  # shellcheck source=/dev/null
+  source "$env"
+}
+
+get_public_ip() {
+  if [[ -n "${PUBLIC_IP:-}" ]]; then
+    echo "$PUBLIC_IP"
+    return
+  fi
+  curl -fsS --max-time 5 https://api.ipify.org \
+    || curl -fsS --max-time 5 https://ifconfig.me \
+    || die "Cannot detect public IP. Set PUBLIC_IP= env variable."
+}
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+cmd_add() {
+  need_root
+  local count="${COUNT:-1}"
+  local sni="$DEFAULT_SNI_DOMAIN"
+  local tag="${PROXY_TAG:-}"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --count|-n) count="$2"; shift 2 ;;
+      --sni)      sni="$2";   shift 2 ;;
+      --tag)      tag="$2";   shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ "$count" =~ ^[0-9]+$ ]] || die "--count must be a number"
+  [[ -f "$BINARY" ]] || die "MTProxy binary not found at $BINARY. Run install.sh first."
+
+  mkdir -p "$INST_DIR"
+
+  local i
+  for (( i=0; i<count; i++ )); do
+    local ts port stats_port secret sni_hex inst env_file
+
+    ts="$(date +%Y%m%d-%H%M%S)"
+    port="$(pick_client_port)"
+    stats_port="$(pick_stats_port)"
+    secret="$(openssl rand -hex 16)"
+    sni_hex="$(domain_hex "$sni")"
+    inst="ee${ts}-${i}"
+    env_file="$INST_DIR/${inst}.env"
+
+    cat >"$env_file" <<EOF
+PORT=$port
+STATS_PORT=$stats_port
+SECRET=ee${secret}${sni_hex}
+SNI_DOMAIN=$sni
+WORKERS=2
+PROXY_TAG=$tag
+EOF
+    chmod 600 "$env_file"
+
+    systemctl enable --now "mtproxy@${inst}" 2>/dev/null || true
+    echo "Added instance: $inst  port=$port"
+  done
+}
+
+cmd_remove() {
+  need_root
+  [[ $# -gt 0 ]] || die "Usage: mtproxy-pool remove INSTANCE [INSTANCE...]"
+  local inst
+  for inst in "$@"; do
+    local env_file="$INST_DIR/${inst}.env"
+    [[ -f "$env_file" ]] || { echo "WARN: instance not found: $inst"; continue; }
+    systemctl stop    "mtproxy@${inst}" 2>/dev/null || true
+    systemctl disable "mtproxy@${inst}" 2>/dev/null || true
+    rm -f "$env_file"
+    echo "Removed: $inst"
+  done
+}
+
+cmd_list() {
+  local insts
+  insts="$(list_instances)"
+  if [[ -z "$insts" ]]; then
+    echo "No instances."
+    return
+  fi
+  printf '%-35s %-8s %-6s\n' "INSTANCE" "STATUS" "PORT"
+  while IFS= read -r inst; do
+    local env_file="$INST_DIR/${inst}.env"
+    local port="?"
+    [[ -f "$env_file" ]] && port="$(grep -m1 '^PORT=' "$env_file" | cut -d= -f2)"
+    local status
+    status="$(systemctl is-active "mtproxy@${inst}" 2>/dev/null || echo inactive)"
+    printf '%-35s %-8s %-6s\n' "$inst" "$status" "$port"
+  done <<< "$insts"
+}
+
+cmd_links() {
+  local host=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host) host="$2"; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$host" ]] || host="$(get_public_ip)"
+
+  local insts
+  insts="$(list_instances)"
+  [[ -n "$insts" ]] || { echo "No instances."; return; }
+
+  while IFS= read -r inst; do
+    local env_file="$INST_DIR/${inst}.env"
+    [[ -f "$env_file" ]] || continue
+    local port secret
+    port="$(grep -m1 '^PORT='   "$env_file" | cut -d= -f2)"
+    secret="$(grep -m1 '^SECRET=' "$env_file" | cut -d= -f2)"
+    echo "tg://proxy?server=${host}&port=${port}&secret=${secret}"
+  done <<< "$insts"
+}
+
+cmd_status() {
+  if [[ $# -eq 0 ]]; then
+    local insts
+    insts="$(list_instances)"
+    [[ -n "$insts" ]] || { echo "No instances."; return; }
+    while IFS= read -r inst; do
+      echo "=== $inst ==="
+      systemctl status "mtproxy@${inst}" --no-pager -l 2>/dev/null || true
+    done <<< "$insts"
+  else
+    local inst
+    for inst in "$@"; do
+      echo "=== $inst ==="
+      systemctl status "mtproxy@${inst}" --no-pager -l 2>/dev/null || true
+    done
+  fi
+}
+
+cmd_start() {
+  need_root
+  [[ $# -gt 0 ]] || die "Usage: mtproxy-pool start INSTANCE [INSTANCE...]"
+  for inst in "$@"; do
+    systemctl start "mtproxy@${inst}" && echo "Started: $inst"
+  done
+}
+
+cmd_stop() {
+  need_root
+  [[ $# -gt 0 ]] || die "Usage: mtproxy-pool stop INSTANCE [INSTANCE...]"
+  for inst in "$@"; do
+    systemctl stop "mtproxy@${inst}" && echo "Stopped: $inst"
+  done
+}
+
+cmd_restart() {
+  need_root
+  if [[ $# -eq 0 ]]; then
+    local insts
+    insts="$(list_instances)"
+    [[ -n "$insts" ]] || { echo "No instances."; return; }
+    while IFS= read -r inst; do
+      systemctl restart "mtproxy@${inst}" && echo "Restarted: $inst"
+    done <<< "$insts"
+  else
+    for inst in "$@"; do
+      systemctl restart "mtproxy@${inst}" && echo "Restarted: $inst"
+    done
+  fi
+}
+
+cmd_refresh() {
+  need_root
+  echo "Updating proxy-secret and proxy-multi.conf..."
+  curl -fsS https://core.telegram.org/getProxySecret  -o "$INSTALL_DIR/proxy-secret"
+  curl -fsS https://core.telegram.org/getProxyConfig  -o "$INSTALL_DIR/proxy-multi.conf"
+  chown mtproxy:mtproxy "$INSTALL_DIR/proxy-secret" "$INSTALL_DIR/proxy-multi.conf"
+  echo "Done. Restarting all instances..."
+  cmd_restart
+}
+
+cmd_doctor() {
+  echo "=== MTProxy doctor ==="
+
+  # Binary
+  if [[ -f "$BINARY" ]]; then
+    echo "[OK] Binary: $BINARY"
+  else
+    echo "[FAIL] Binary not found: $BINARY — run install.sh"
+  fi
+
+  # Config files
+  for f in proxy-secret proxy-multi.conf; do
+    if [[ -f "$INSTALL_DIR/$f" ]]; then
+      echo "[OK] $f"
+    else
+      echo "[FAIL] $INSTALL_DIR/$f missing — run: mtproxy-pool refresh"
+    fi
+  done
+
+  # Service template
+  if [[ -f "$SERVICE_TMPL" ]]; then
+    echo "[OK] Service template: $SERVICE_TMPL"
+  else
+    echo "[FAIL] Service template missing: $SERVICE_TMPL — run install.sh"
+  fi
+
+  # Runner
+  if [[ -f "$RUNNER" ]]; then
+    echo "[OK] Runner: $RUNNER"
+  else
+    echo "[FAIL] Runner missing: $RUNNER — run install.sh"
+  fi
+
+  # Instances
+  local insts
+  insts="$(list_instances)"
+  if [[ -z "$insts" ]]; then
+    echo "[WARN] No instances found — run: mtproxy-pool add"
+  else
+    while IFS= read -r inst; do
+      local status
+      status="$(systemctl is-active "mtproxy@${inst}" 2>/dev/null || echo inactive)"
+      if [[ "$status" == "active" ]]; then
+        echo "[OK] $inst: $status"
+      else
+        echo "[WARN] $inst: $status"
+      fi
+    done <<< "$insts"
+  fi
+
+  # Refresh timer
+  if systemctl is-active mtproxy-pool-refresh.timer &>/dev/null; then
+    echo "[OK] Refresh timer active"
+  else
+    echo "[WARN] Refresh timer not active — run: systemctl enable --now mtproxy-pool-refresh.timer"
+  fi
+}
+
+cmd_uninstall() {
+  need_root
+  echo "This will stop and remove ALL MTProxy instances and system files."
+  read -r -p "Are you sure? [y/N] " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; return; }
+
+  # Stop and disable all instances
+  local insts
+  insts="$(list_instances)"
+  if [[ -n "$insts" ]]; then
+    while IFS= read -r inst; do
+      systemctl stop    "mtproxy@${inst}" 2>/dev/null || true
+      systemctl disable "mtproxy@${inst}" 2>/dev/null || true
+      echo "Removed instance: $inst"
+    done <<< "$insts"
+  fi
+
+  # Stop and disable refresh timer/service
+  systemctl stop    mtproxy-pool-refresh.timer   2>/dev/null || true
+  systemctl disable mtproxy-pool-refresh.timer   2>/dev/null || true
+  systemctl stop    mtproxy-pool-refresh.service 2>/dev/null || true
+
+  # Remove system files
+  rm -f "$SERVICE_TMPL"
+  rm -f "$RUNNER"
+  rm -f /usr/local/bin/mtproxy-pool
+  rm -f /usr/local/bin/mtproxy-pool-refresh.sh
+  rm -f /etc/systemd/system/mtproxy-pool-refresh.service
+  rm -f /etc/systemd/system/mtproxy-pool-refresh.timer
+  rm -f /etc/sysctl.d/99-mtproxy-pidmax.conf
+
+  # Remove instance configs and pool dir
+  rm -rf "$POOL_DIR"
+
+  # Remove MTProxy binary and sources
+  rm -rf "$INSTALL_DIR"
+
+  # Remove mtproxy user
+  id -u mtproxy >/dev/null 2>&1 && userdel mtproxy || true
+
+  systemctl daemon-reload
+  echo "✓ MTProxy fully removed."
+}
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  add)     cmd_add     "$@" ;;
+  remove)  cmd_remove  "$@" ;;
+  list)    cmd_list         ;;
+  links)   cmd_links   "$@" ;;
+  status)  cmd_status  "$@" ;;
+  start)   cmd_start   "$@" ;;
+  stop)    cmd_stop    "$@" ;;
+  restart) cmd_restart "$@" ;;
+  refresh)   cmd_refresh         ;;
+  doctor)    cmd_doctor          ;;
+  uninstall) cmd_uninstall       ;;
+  help|--help|-h) usage          ;;
+  *) die "Unknown command: $cmd. Run 'mtproxy-pool help'" ;;
+esac
+
